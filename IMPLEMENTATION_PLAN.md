@@ -51,7 +51,7 @@ Milestone tracker:
 | Milestone | Status | Owner | Target Finish | Evidence |
 | --- | --- | --- | --- | --- |
 | M1 Backend process supervisor | done | Codex | TBD | `main.py` lifecycle supervisor + APIs implemented; local gates passed (`pnpm run build`, `python -m py_compile`, JSON validation, mocked backend smoke for start/stop + duplicate-start + `START_PROCESS_FAILED` + `PIPELINE_BROKEN`) |
-| M2 Steam Deck runtime integration | not_started | TBD | TBD | TBD |
+| M2 Steam Deck runtime integration | in_progress | Codex | TBD | `main.py` now resolves bundled binary, applies Deck pre-start actions, spawns explicit `pw-ac3-live -> aplay` pipeline, routes sink, runs shared cleanup/restore, rejects unsafe `extra_args`, and normalizes unexpected startup exceptions; local compile/build + mocked config/hardening smoke passed; Steam Deck hardware validation pending |
 | M3 Frontend controls and status UX | not_started | TBD | TBD | TBD |
 | M4 Diagnostics and recovery | not_started | TBD | TBD | TBD |
 | M5 Release hardening | not_started | TBD | TBD | TBD |

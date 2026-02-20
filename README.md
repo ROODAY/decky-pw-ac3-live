@@ -13,6 +13,14 @@ This repository contains the Decky plugin implementation for `pw-ac3-live`, incl
 - Decky metadata (`plugin.json`, `package.json`)
 - Packaged defaults (`defaults/`)
 
+## Current Status
+
+- Backend milestones M1-M2 are implemented in `main.py`:
+  - guarded lifecycle state machine
+  - explicit `pw-ac3-live --stdout` producer + `aplay` consumer pipeline
+  - Steam Deck pre-start audio actions and cleanup/restore sequence
+  - structured status/error/log backend APIs
+
 ## About pw-ac3-live
 
 `pw-ac3-live` is the core encoder daemon used by this plugin. It captures 5.1 LPCM, encodes it to AC-3 in real time, and outputs an IEC61937 stream for HDMI/SPDIF passthrough.
