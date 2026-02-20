@@ -70,56 +70,56 @@ DECKY_PLUGIN_SETTINGS_DIR: str
 """
 The recommended path in which to store configuration files (created automatically).
 Environment variable: `DECKY_PLUGIN_SETTINGS_DIR`.
-e.g.: `/home/deck/homebrew/settings/decky-plugin-template`
+e.g.: `/home/deck/homebrew/settings/decky-pw-ac3-live`
 """
 
 DECKY_PLUGIN_RUNTIME_DIR: str
 """
 The recommended path in which to store runtime data (created automatically).
 Environment variable: `DECKY_PLUGIN_RUNTIME_DIR`.
-e.g.: `/home/deck/homebrew/data/decky-plugin-template`
+e.g.: `/home/deck/homebrew/data/decky-pw-ac3-live`
 """
 
 DECKY_PLUGIN_LOG_DIR: str
 """
 The recommended path in which to store persistent logs (created automatically).
 Environment variable: `DECKY_PLUGIN_LOG_DIR`.
-e.g.: `/home/deck/homebrew/logs/decky-plugin-template`
+e.g.: `/home/deck/homebrew/logs/decky-pw-ac3-live`
 """
 
 DECKY_PLUGIN_DIR: str
 """
 The root of the plugin's directory.
 Environment variable: `DECKY_PLUGIN_DIR`.
-e.g.: `/home/deck/homebrew/plugins/decky-plugin-template`
+e.g.: `/home/deck/homebrew/plugins/decky-pw-ac3-live`
 """
 
 DECKY_PLUGIN_NAME: str
 """
 The name of the plugin as specified in the 'plugin.json'.
 Environment variable: `DECKY_PLUGIN_NAME`.
-e.g.: `Example Plugin`
+e.g.: `pw-ac3-live`
 """
 
 DECKY_PLUGIN_VERSION: str
 """
 The version of the plugin as specified in the 'package.json'.
 Environment variable: `DECKY_PLUGIN_VERSION`.
-e.g.: `0.0.1`
+e.g.: `0.1.0`
 """
 
 DECKY_PLUGIN_AUTHOR: str
 """
 The author of the plugin as specified in the 'plugin.json'.
 Environment variable: `DECKY_PLUGIN_AUTHOR`.
-e.g.: `John Doe`
+e.g.: `Alexandre Poux`
 """
 
 DECKY_PLUGIN_LOG: str
 """
 The path to the plugin's main logfile.
 Environment variable: `DECKY_PLUGIN_LOG`.
-e.g.: `/home/deck/homebrew/logs/decky-plugin-template/plugin.log`
+e.g.: `/home/deck/homebrew/logs/decky-pw-ac3-live/plugin.log`
 """
 
 """

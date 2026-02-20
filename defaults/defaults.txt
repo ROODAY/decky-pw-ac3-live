@@ -1,13 +1,8 @@
-If you have plain-text json configs, theme templates, or templates for usage for your plugin of any description you should have those files be in here.
-Those files will be pulled into the zip during the build process and included with the upload. Example: CssLoader with it's themes in "default/themes" would have the "themes" folder will be added alongside with the dist folder, main.py, LICENSE and README files in the subfolder of the zip containing the plugin.
-Files can also be put in here such as a config, just keep in mind that they this directory cannot be utilized to put files in arbitrary locations, just within the extracted root folder of the plugin, ex: CssLoader has "defaults/themes/..." setup in it's repo, but when packaged to go to the store, the file structure will be:
+This directory stores default data for decky-pw-ac3-live.
 
-- LICENSE
-- README
-- dist
-  - index.js
-- main.py
-- package.json
-- plugin.json
-- themes
-  - exampletheme.css
+Use it for:
+- default backend config (JSON)
+- recovery profile presets for Steam Deck HDMI/ALSA path
+- optional UI preset files
+
+Files in this directory are bundled with the plugin release and extracted at plugin root.

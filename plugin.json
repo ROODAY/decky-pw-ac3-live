@@ -1,11 +1,11 @@
 {
-  "name": "Example Plugin",
-  "author": "John Doe",
-  "flags": ["debug", "_root"],
+  "name": "pw-ac3-live",
+  "author": "Alexandre Poux",
+  "flags": [],
   "api_version": 1,
   "publish": {
-    "tags": ["template", "root"],
-    "description": "Decky example plugin.",
-    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+    "tags": ["audio", "ac3", "pipewire", "steamdeck", "hdmi"],
+    "description": "Decky control surface for pw-ac3-live AC-3 passthrough on Steam Deck.",
+    "image": "https://opengraph.githubassets.com/1/pums974/decky-pw-ac3-live"
   }
 }
