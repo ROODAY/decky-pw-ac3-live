@@ -50,7 +50,7 @@ Milestone tracker:
 
 | Milestone | Status | Owner | Target Finish | Evidence |
 | --- | --- | --- | --- | --- |
-| M1 Backend process supervisor | not_started | TBD | TBD | TBD |
+| M1 Backend process supervisor | done | Codex | TBD | `main.py` lifecycle supervisor + APIs implemented; local gates passed (`pnpm run build`, `python -m py_compile`, JSON validation, mocked backend smoke for start/stop + duplicate-start + `START_PROCESS_FAILED` + `PIPELINE_BROKEN`) |
 | M2 Steam Deck runtime integration | not_started | TBD | TBD | TBD |
 | M3 Frontend controls and status UX | not_started | TBD | TBD | TBD |
 | M4 Diagnostics and recovery | not_started | TBD | TBD | TBD |
