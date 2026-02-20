@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import os
+import pwd
 import re
 import shlex
 import signal
@@ -59,6 +60,7 @@ class Plugin:
         self._producer_process: asyncio.subprocess.Process | None = None
         self._consumer_process: asyncio.subprocess.Process | None = None
         self._pipeline_pgid: int | None = None
+        self._consumer_pgid: int | None = None
 
         self._pipeline_monitor_task: asyncio.Task[None] | None = None
         self._producer_stderr_task: asyncio.Task[None] | None = None
@@ -70,6 +72,7 @@ class Plugin:
 
         self._logs: deque[dict[str, Any]] = deque(maxlen=LOG_BUFFER_MAX_LINES)
         self._next_log_seq = 1
+        self._runtime_env_warning_logged = False
 
     # Diagnostic method for frontend/backend connectivity checks.
     async def add(self, left: int, right: int) -> int:
@@ -621,6 +624,8 @@ class Plugin:
         producer: asyncio.subprocess.Process | None = None
         consumer: asyncio.subprocess.Process | None = None
         producer_pgid: int | None = None
+        consumer_pgid: int | None = None
+        subprocess_env = self._build_subprocess_env()
 
         read_fd, write_fd = os.pipe()
         try:
@@ -630,6 +635,7 @@ class Plugin:
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=write_fd,
                     stderr=asyncio.subprocess.PIPE,
+                    env=subprocess_env,
                     preexec_fn=os.setsid,
                 )
             except FileNotFoundError as exc:
@@ -665,8 +671,10 @@ class Plugin:
                     stdin=read_fd,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
+                    env=subprocess_env,
                     preexec_fn=join_producer_group,
                 )
+                consumer_pgid = os.getpgid(consumer.pid)
             except FileNotFoundError as exc:
                 await self._terminate_orphan_process_group(producer_pgid, producer)
                 return self._make_error(
@@ -684,13 +692,57 @@ class Plugin:
                     hint="Check Decky plugin execution permissions.",
                 )
             except Exception as exc:
-                await self._terminate_orphan_process_group(producer_pgid, producer)
-                return self._make_error(
-                    code="START_PROCESS_FAILED",
-                    message="Failed to spawn consumer process.",
-                    detail=f"command={consumer_cmd_str} error={exc}",
-                    hint="Check logs and command arguments.",
+                if not self._is_preexec_failure(exc):
+                    await self._terminate_orphan_process_group(producer_pgid, producer)
+                    return self._make_error(
+                        code="START_PROCESS_FAILED",
+                        message="Failed to spawn consumer process.",
+                        detail=f"command={consumer_cmd_str} error={exc}",
+                        hint="Check logs and command arguments.",
+                    )
+
+                self._append_log(
+                    "WARN",
+                    (
+                        "Consumer preexec join to producer group failed. "
+                        "Retrying with consumer in a dedicated process group. "
+                        f"error={exc}"
+                    ),
                 )
+                try:
+                    consumer = await asyncio.create_subprocess_exec(
+                        *consumer_command,
+                        stdin=read_fd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=subprocess_env,
+                        preexec_fn=os.setsid,
+                    )
+                    consumer_pgid = os.getpgid(consumer.pid)
+                except FileNotFoundError as fallback_exc:
+                    await self._terminate_orphan_process_group(producer_pgid, producer)
+                    return self._make_error(
+                        code="DEPENDENCY_MISSING",
+                        message="Consumer command is missing.",
+                        detail=f"command={consumer_cmd_str} error={fallback_exc}",
+                        hint="Ensure aplay is installed and available in PATH.",
+                    )
+                except PermissionError as fallback_exc:
+                    await self._terminate_orphan_process_group(producer_pgid, producer)
+                    return self._make_error(
+                        code="PERMISSION_DENIED",
+                        message="Consumer process could not be spawned due to permissions.",
+                        detail=f"command={consumer_cmd_str} error={fallback_exc}",
+                        hint="Check Decky plugin execution permissions.",
+                    )
+                except Exception as fallback_exc:
+                    await self._terminate_orphan_process_group(producer_pgid, producer)
+                    return self._make_error(
+                        code="START_PROCESS_FAILED",
+                        message="Failed to spawn consumer process.",
+                        detail=f"command={consumer_cmd_str} error={fallback_exc}",
+                        hint="Check logs and command arguments.",
+                    )
 
         finally:
             with contextlib.suppress(OSError):
@@ -701,6 +753,7 @@ class Plugin:
         self._producer_process = producer
         self._consumer_process = consumer
         self._pipeline_pgid = producer_pgid
+        self._consumer_pgid = consumer_pgid
 
         if producer is not None and producer.stderr is not None:
             self._producer_stderr_task = asyncio.create_task(
@@ -723,7 +776,8 @@ class Plugin:
             "INFO",
             (
                 "Pipeline spawned "
-                f"producer_pid={producer.pid} consumer_pid={consumer.pid} pgid={producer_pgid}"
+                f"producer_pid={producer.pid} producer_pgid={producer_pgid} "
+                f"consumer_pid={consumer.pid} consumer_pgid={consumer_pgid}"
             ),
         )
         return None
@@ -899,7 +953,7 @@ class Plugin:
 
     async def _apply_pre_start_audio_actions_locked(self) -> dict[str, Any] | None:
         self._audio_state_modified = True
-        steps = [
+        mandatory_steps = [
             (
                 ["pactl", "set-card-profile", DECK_HDMI_CARD, "off"],
                 "set HDMI card profile off",
@@ -908,21 +962,9 @@ class Plugin:
                 ["iecset", "-c", "0", "-n", "2", "audio", "off", "rate", "48000"],
                 "disable IEC958 audio before pipeline start",
             ),
-            (
-                ["amixer", "-c", "0", "set", "Master", "100%", "unmute"],
-                "set Master to 100% unmuted",
-            ),
-            (
-                ["amixer", "-c", "0", "set", "PCM", "100%", "unmute"],
-                "set PCM to 100% unmuted",
-            ),
-            (
-                ["amixer", "-c", "0", "set", "IEC958,2", "unmute"],
-                "set IEC958,2 unmuted",
-            ),
         ]
 
-        for command, description in steps:
+        for command, description in mandatory_steps:
             result = await self._run_command(command, timeout_s=8.0)
             if result["ok"]:
                 continue
@@ -933,6 +975,73 @@ class Plugin:
                 hint="Inspect command detail in logs and verify Steam Deck audio state.",
             )
 
+        master_error = await self._apply_amixer_control_with_fallback_locked(
+            controls=["Master", "Speaker", "Headphone"],
+            description="set Master to 100% unmuted",
+            include_volume=True,
+        )
+        if master_error is not None:
+            return master_error
+
+        pcm_error = await self._apply_amixer_control_with_fallback_locked(
+            controls=["PCM"],
+            description="set PCM to 100% unmuted",
+            include_volume=True,
+        )
+        if pcm_error is not None:
+            return pcm_error
+
+        iec958_error = await self._apply_amixer_control_with_fallback_locked(
+            controls=["IEC958,2", "IEC958"],
+            description="set IEC958,2 unmuted",
+            include_volume=False,
+        )
+        if iec958_error is not None:
+            return iec958_error
+
+        return None
+
+    async def _apply_amixer_control_with_fallback_locked(
+        self,
+        controls: list[str],
+        description: str,
+        include_volume: bool,
+    ) -> dict[str, Any] | None:
+        missing_controls: list[str] = []
+
+        for control in controls:
+            command = ["amixer", "-c", "0", "set", control]
+            if include_volume:
+                command.append("100%")
+            command.append("unmute")
+
+            result = await self._run_command(command, timeout_s=8.0, check=False)
+            if result["ok"]:
+                if control != controls[0]:
+                    self._append_log(
+                        "WARN",
+                        f"{description}: fallback control '{control}' used.",
+                    )
+                return None
+
+            if self._is_missing_amixer_control(result):
+                missing_controls.append(control)
+                continue
+
+            return self._command_failure_to_error(
+                result,
+                code="START_PROCESS_FAILED",
+                message=f"Failed to {description}.",
+                hint="Inspect command detail in logs and verify Steam Deck audio mixer controls.",
+            )
+
+        self._append_log(
+            "WARN",
+            (
+                f"{description}: no matching mixer control found, continuing. "
+                f"checked={missing_controls}"
+            ),
+        )
         return None
 
     async def _route_audio_into_encoder_locked(self) -> dict[str, Any] | None:
@@ -983,8 +1092,22 @@ class Plugin:
             move_input_res = await self._run_command(
                 ["pactl", "move-sink-input", sink_input_id, PIPELINE_INPUT_SINK],
                 timeout_s=5.0,
+                check=False,
             )
-            if not move_input_res["ok"]:
+            if move_input_res["ok"]:
+                continue
+
+            if self._is_no_such_entity_error(move_input_res):
+                self._append_log(
+                    "WARN",
+                    (
+                        f"Sink input {sink_input_id} disappeared before move; "
+                        "continuing routing."
+                    ),
+                )
+                continue
+
+            if move_input_res["returncode"] != 0:
                 return self._command_failure_to_error(
                     move_input_res,
                     code="START_PROCESS_FAILED",
@@ -1209,11 +1332,14 @@ class Plugin:
         if pgid is None:
             await self._clear_pipeline_handles_locked()
             return None
+        pgids, collect_error = self._collect_pipeline_pgids_locked(producer_pgid=pgid)
+        if collect_error is not None:
+            return collect_error
 
         timeout_s = timeout_ms / 1000.0
         if force:
-            self._append_log("INFO", f"Force-stopping process group pgid={pgid} with SIGKILL")
-            signal_error = self._send_group_signal(pgid, signal.SIGKILL)
+            self._append_log("INFO", f"Force-stopping process groups pgids={pgids} with SIGKILL")
+            signal_error = self._send_signal_to_groups(pgids, signal.SIGKILL)
             if signal_error is not None:
                 return signal_error
 
@@ -1222,7 +1348,7 @@ class Plugin:
                 return self._make_error(
                     code="STOP_TIMEOUT",
                     message="Encoder did not terminate after SIGKILL.",
-                    detail=f"pgid={pgid} timeout_ms={timeout_ms}",
+                    detail=f"pgids={pgids} timeout_ms={timeout_ms}",
                     hint="Retry stop or restart Decky.",
                 )
 
@@ -1234,8 +1360,8 @@ class Plugin:
         if hard_s <= 0:
             hard_s = 2.0
 
-        self._append_log("INFO", f"Stopping process group pgid={pgid} with SIGTERM")
-        signal_error = self._send_group_signal(pgid, signal.SIGTERM)
+        self._append_log("INFO", f"Stopping process groups pgids={pgids} with SIGTERM")
+        signal_error = self._send_signal_to_groups(pgids, signal.SIGTERM)
         if signal_error is not None:
             return signal_error
 
@@ -1244,8 +1370,8 @@ class Plugin:
             await self._clear_pipeline_handles_locked()
             return None
 
-        self._append_log("WARN", f"Process group pgid={pgid} still alive, escalating to SIGKILL")
-        signal_error = self._send_group_signal(pgid, signal.SIGKILL)
+        self._append_log("WARN", f"Process groups pgids={pgids} still alive, escalating to SIGKILL")
+        signal_error = self._send_signal_to_groups(pgids, signal.SIGKILL)
         if signal_error is not None:
             return signal_error
 
@@ -1254,7 +1380,7 @@ class Plugin:
             return self._make_error(
                 code="STOP_TIMEOUT",
                 message="Encoder process group did not terminate in time.",
-                detail=f"pgid={pgid} timeout_ms={timeout_ms}",
+                detail=f"pgids={pgids} timeout_ms={timeout_ms}",
                 hint="Retry stop or restart Decky.",
             )
 
@@ -1296,6 +1422,7 @@ class Plugin:
         self._producer_process = None
         self._consumer_process = None
         self._pipeline_pgid = None
+        self._consumer_pgid = None
 
     async def _cancel_task_locked(self, task: asyncio.Task[None] | None) -> None:
         if task is None or task.done():
@@ -1357,6 +1484,7 @@ class Plugin:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=self._build_subprocess_env(),
             )
         except FileNotFoundError as exc:
             error = self._make_error(
@@ -1478,6 +1606,69 @@ class Plugin:
                 await self._emit_state_changed_locked()
             self._append_log("INFO", f"Lifecycle cleanup completed for {source}.")
 
+    def _build_subprocess_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+
+        runtime_dir = self._resolve_audio_runtime_dir()
+        if runtime_dir is not None:
+            env["XDG_RUNTIME_DIR"] = runtime_dir
+
+            pulse_socket = os.path.join(runtime_dir, "pulse", "native")
+            if os.path.exists(pulse_socket):
+                env["PULSE_SERVER"] = f"unix:{pulse_socket}"
+
+            bus_socket = os.path.join(runtime_dir, "bus")
+            if os.path.exists(bus_socket):
+                env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_socket}"
+
+            env.setdefault("PIPEWIRE_RUNTIME_DIR", runtime_dir)
+
+            if not self._runtime_env_warning_logged and not os.path.exists(pulse_socket):
+                self._runtime_env_warning_logged = True
+                self._append_log(
+                    "WARN",
+                    (
+                        "Pulse socket not found while preparing subprocess env: "
+                        f"{pulse_socket}"
+                    ),
+                )
+
+        return env
+
+    def _resolve_audio_runtime_dir(self) -> str | None:
+        candidates: list[str] = []
+
+        env_runtime = os.environ.get("XDG_RUNTIME_DIR")
+        if isinstance(env_runtime, str) and env_runtime.strip():
+            candidates.append(env_runtime.strip())
+
+        current_uid_runtime = f"/run/user/{os.getuid()}"
+        if current_uid_runtime not in candidates:
+            candidates.append(current_uid_runtime)
+
+        decky_user_uid = self._resolve_decky_user_uid()
+        if decky_user_uid is not None:
+            decky_runtime = f"/run/user/{decky_user_uid}"
+            if decky_runtime not in candidates:
+                candidates.append(decky_runtime)
+
+        for candidate in candidates:
+            if os.path.isdir(candidate):
+                return candidate
+
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _resolve_decky_user_uid() -> int | None:
+        decky_user = getattr(decky, "DECKY_USER", None)
+        if not isinstance(decky_user, str) or not decky_user:
+            return None
+
+        try:
+            return pwd.getpwnam(decky_user).pw_uid
+        except KeyError:
+            return None
+
     async def _emit_state_changed_locked(self) -> None:
         await self._emit_safe("encoder_state_changed", self._build_status_payload_locked())
 
@@ -1552,6 +1743,60 @@ class Plugin:
             )
 
         return observed_pgid, None
+
+    def _resolve_consumer_pgid_locked(self) -> tuple[int | None, dict[str, Any] | None]:
+        consumer_pid = self._active_consumer_pid_locked()
+        observed_pgid: int | None = None
+        if consumer_pid is not None:
+            with contextlib.suppress(ProcessLookupError):
+                observed_pgid = os.getpgid(consumer_pid)
+
+        if observed_pgid is None:
+            return self._consumer_pgid, None
+
+        if self._consumer_pgid is None:
+            self._consumer_pgid = observed_pgid
+            return observed_pgid, None
+
+        if observed_pgid != self._consumer_pgid:
+            return None, self._make_error(
+                code="PIPELINE_BROKEN",
+                message="Consumer process-group ownership changed unexpectedly.",
+                detail=(
+                    f"consumer_pid={consumer_pid} "
+                    f"expected_pgid={self._consumer_pgid} actual_pgid={observed_pgid}"
+                ),
+                hint="Restart encoder to recreate a clean pipeline.",
+            )
+
+        return observed_pgid, None
+
+    def _collect_pipeline_pgids_locked(
+        self,
+        producer_pgid: int | None,
+    ) -> tuple[list[int], dict[str, Any] | None]:
+        pgids: list[int] = []
+        if producer_pgid is not None:
+            pgids.append(producer_pgid)
+
+        consumer_pgid, consumer_error = self._resolve_consumer_pgid_locked()
+        if consumer_error is not None:
+            return [], consumer_error
+        if consumer_pgid is not None and consumer_pgid not in pgids:
+            pgids.append(consumer_pgid)
+
+        return pgids, None
+
+    def _send_signal_to_groups(
+        self,
+        pgids: list[int],
+        signum: signal.Signals,
+    ) -> dict[str, Any] | None:
+        for pgid in pgids:
+            signal_error = self._send_group_signal(pgid, signum)
+            if signal_error is not None:
+                return signal_error
+        return None
 
     def _send_group_signal(self, pgid: int, signum: signal.Signals) -> dict[str, Any] | None:
         try:
@@ -1705,6 +1950,52 @@ class Plugin:
             if parts[1] == sink_name:
                 return True
         return False
+
+    @staticmethod
+    def _is_preexec_failure(exc: Exception) -> bool:
+        return "preexec_fn" in str(exc).lower()
+
+    @staticmethod
+    def _is_missing_amixer_control(command_result: dict[str, Any]) -> bool:
+        haystack = " ".join(
+            [
+                str(command_result.get("stdout", "")),
+                str(command_result.get("stderr", "")),
+                command_result.get("error", {}).get("detail", "")
+                if isinstance(command_result.get("error"), dict)
+                else "",
+            ]
+        ).lower()
+
+        return any(
+            needle in haystack
+            for needle in (
+                "unable to find simple control",
+                "cannot find the given element from control",
+                "amixer: unable to find simple control",
+            )
+        )
+
+    @staticmethod
+    def _is_no_such_entity_error(command_result: dict[str, Any]) -> bool:
+        haystack = " ".join(
+            [
+                str(command_result.get("stdout", "")),
+                str(command_result.get("stderr", "")),
+                command_result.get("error", {}).get("detail", "")
+                if isinstance(command_result.get("error"), dict)
+                else "",
+            ]
+        ).lower()
+
+        return any(
+            needle in haystack
+            for needle in (
+                "no such entity",
+                "not found",
+                "does not exist",
+            )
+        )
 
     def _normalize_timeout_ms(self, timeout_ms: int) -> int:
         if not isinstance(timeout_ms, int):

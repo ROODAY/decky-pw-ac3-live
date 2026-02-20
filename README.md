@@ -20,6 +20,10 @@ This repository contains the Decky plugin implementation for `pw-ac3-live`, incl
   - explicit `pw-ac3-live --stdout` producer + `aplay` consumer pipeline
   - Steam Deck pre-start audio actions and cleanup/restore sequence
   - structured status/error/log backend APIs
+- Frontend milestone M3 is implemented in `src/index.tsx`:
+  - start/stop controls wired to backend APIs
+  - backend state/error rendering with event-driven refresh
+  - transition-aware button disabling and user toasts
 
 ## About pw-ac3-live
 
