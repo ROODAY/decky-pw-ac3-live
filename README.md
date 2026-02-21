@@ -17,7 +17,7 @@ This repository contains the Decky plugin implementation for `pw-ac3-live`, incl
 
 - Backend milestones M1-M2 are implemented in `main.py`:
   - guarded lifecycle state machine
-  - explicit `pw-ac3-live --stdout` producer + `aplay` consumer pipeline
+  - explicit `pw-ac3-live --alsa-direct --target hw:0,8` runtime path
   - Steam Deck pre-start audio actions and cleanup/restore sequence
   - structured status/error/log backend APIs
 - Frontend milestone M3 is implemented in `src/index.tsx`:

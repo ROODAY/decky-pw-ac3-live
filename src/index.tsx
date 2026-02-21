@@ -35,8 +35,7 @@ interface EncoderStatusPayload {
 }
 
 interface PipelineStatus {
-  producer_pid: number | null;
-  consumer_pid: number | null;
+  encoder_pid: number | null;
 }
 
 interface StartEncoderConfig {
@@ -48,8 +47,9 @@ interface StartEncoderConfig {
   output_buffer_size?: number | null;
   ffmpeg_thread_queue_size?: number;
   ffmpeg_chunk_frames?: number;
-  aplay_buffer_time_us?: number;
-  aplay_period_time_us?: number;
+  alsa_latency_us?: number;
+  alsa_iec_card?: number;
+  alsa_iec_index?: number;
 }
 
 interface StartEncoderResponse {
@@ -81,8 +81,9 @@ interface RuntimeConfigForm {
   outputBufferSize: string;
   ffmpegThreadQueueSize: string;
   ffmpegChunkFrames: string;
-  aplayBufferTimeUs: string;
-  aplayPeriodTimeUs: string;
+  alsaLatencyUs: string;
+  alsaIecCard: string;
+  alsaIecIndex: string;
 }
 
 const DEFAULT_RUNTIME_CONFIG: RuntimeConfigForm = {
@@ -94,8 +95,9 @@ const DEFAULT_RUNTIME_CONFIG: RuntimeConfigForm = {
   outputBufferSize: "",
   ffmpegThreadQueueSize: "4",
   ffmpegChunkFrames: "1536",
-  aplayBufferTimeUs: "60000",
-  aplayPeriodTimeUs: "15000",
+  alsaLatencyUs: "60000",
+  alsaIecCard: "0",
+  alsaIecIndex: "2",
 };
 
 const startEncoder = callable<[config?: StartEncoderConfig], StartEncoderResponse>(
@@ -130,8 +132,7 @@ function errorToMessage(error: unknown): string {
 function Content() {
   const [status, setStatus] = useState<EncoderStatusPayload | null>(null);
   const [pipeline, setPipeline] = useState<PipelineStatus>({
-    producer_pid: null,
-    consumer_pid: null,
+    encoder_pid: null,
   });
   const [lastTransitionAt, setLastTransitionAt] = useState<string | null>(null);
   const [runtimeConfig, setRuntimeConfig] =
@@ -279,6 +280,14 @@ function Content() {
       return parsed;
     };
 
+    const parseNonNegativeInt = (rawValue: string): number | null => {
+      const parsed = Number.parseInt(rawValue.trim(), 10);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        return null;
+      }
+      return parsed;
+    };
+
     const parseOptionalPositiveInt = (rawValue: string): number | null | undefined => {
       if (!rawValue.trim()) {
         return undefined;
@@ -309,14 +318,19 @@ function Content() {
       return fail("ffmpeg chunk frames must be a positive integer.");
     }
 
-    const aplayBufferTimeUs = parsePositiveInt(runtimeConfig.aplayBufferTimeUs);
-    if (aplayBufferTimeUs === null) {
-      return fail("aplay buffer time must be a positive integer.");
+    const alsaLatencyUs = parsePositiveInt(runtimeConfig.alsaLatencyUs);
+    if (alsaLatencyUs === null) {
+      return fail("ALSA latency must be a positive integer.");
     }
 
-    const aplayPeriodTimeUs = parsePositiveInt(runtimeConfig.aplayPeriodTimeUs);
-    if (aplayPeriodTimeUs === null) {
-      return fail("aplay period time must be a positive integer.");
+    const alsaIecCard = parseNonNegativeInt(runtimeConfig.alsaIecCard);
+    if (alsaIecCard === null) {
+      return fail("ALSA IEC card index must be a non-negative integer.");
+    }
+
+    const alsaIecIndex = parseNonNegativeInt(runtimeConfig.alsaIecIndex);
+    if (alsaIecIndex === null) {
+      return fail("ALSA IEC index must be a non-negative integer.");
     }
 
     const bufferSize = parseOptionalPositiveInt(runtimeConfig.bufferSize);
@@ -338,8 +352,9 @@ function Content() {
       output_buffer_size: outputBufferSize ?? null,
       ffmpeg_thread_queue_size: ffmpegThreadQueueSize,
       ffmpeg_chunk_frames: ffmpegChunkFrames,
-      aplay_buffer_time_us: aplayBufferTimeUs,
-      aplay_period_time_us: aplayPeriodTimeUs,
+      alsa_latency_us: alsaLatencyUs,
+      alsa_iec_card: alsaIecCard,
+      alsa_iec_index: alsaIecIndex,
     };
 
     return payload;
@@ -416,10 +431,7 @@ function Content() {
           <div>State: <strong>{status?.state ?? "loading"}</strong></div>
         </PanelSectionRow>
         <PanelSectionRow>
-          <div>Producer PID: <strong>{pipeline.producer_pid ?? "-"}</strong></div>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <div>Consumer PID: <strong>{pipeline.consumer_pid ?? "-"}</strong></div>
+          <div>Encoder PID: <strong>{pipeline.encoder_pid ?? "-"}</strong></div>
         </PanelSectionRow>
         <PanelSectionRow>
           <div>Started At: <strong>{formatTimestamp(status?.started_at ?? null)}</strong></div>
@@ -580,14 +592,14 @@ function Content() {
 
             <PanelSectionRow>
               <TextField
-                label="aplay buffer time (us)"
-                value={runtimeConfig.aplayBufferTimeUs}
+                label="ALSA latency (us)"
+                value={runtimeConfig.alsaLatencyUs}
                 mustBeNumeric
                 disabled={controlsLocked}
                 onChange={(event) =>
                   setRuntimeConfig((current) => ({
                     ...current,
-                    aplayBufferTimeUs: event.target.value,
+                    alsaLatencyUs: event.target.value,
                   }))
                 }
               />
@@ -595,14 +607,29 @@ function Content() {
 
             <PanelSectionRow>
               <TextField
-                label="aplay period time (us)"
-                value={runtimeConfig.aplayPeriodTimeUs}
+                label="ALSA IEC card"
+                value={runtimeConfig.alsaIecCard}
                 mustBeNumeric
                 disabled={controlsLocked}
                 onChange={(event) =>
                   setRuntimeConfig((current) => ({
                     ...current,
-                    aplayPeriodTimeUs: event.target.value,
+                    alsaIecCard: event.target.value,
+                  }))
+                }
+              />
+            </PanelSectionRow>
+
+            <PanelSectionRow>
+              <TextField
+                label="ALSA IEC index"
+                value={runtimeConfig.alsaIecIndex}
+                mustBeNumeric
+                disabled={controlsLocked}
+                onChange={(event) =>
+                  setRuntimeConfig((current) => ({
+                    ...current,
+                    alsaIecIndex: event.target.value,
                   }))
                 }
               />

@@ -34,8 +34,9 @@ DEFAULT_ALSA_DEVICE = "hw:0,8"
 DEFAULT_LATENCY = "1536/48000"
 DEFAULT_FFMPEG_THREAD_QUEUE_SIZE = 4
 DEFAULT_FFMPEG_CHUNK_FRAMES = 1536
-DEFAULT_APLAY_BUFFER_TIME_US = 60000
-DEFAULT_APLAY_PERIOD_TIME_US = 15000
+DEFAULT_ALSA_LATENCY_US = 60000
+DEFAULT_ALSA_IEC_CARD = 0
+DEFAULT_ALSA_IEC_INDEX = 2
 PIPELINE_INPUT_SINK = "pw-ac3-live-input"
 
 BUNDLED_BINARY_RELATIVE_PATH = os.path.join("bin", "pw-ac3-live")
@@ -57,14 +58,11 @@ class Plugin:
         self._started_at: str | None = None
         self._last_transition_at = self._utc_now()
 
-        self._producer_process: asyncio.subprocess.Process | None = None
-        self._consumer_process: asyncio.subprocess.Process | None = None
-        self._pipeline_pgid: int | None = None
-        self._consumer_pgid: int | None = None
+        self._encoder_process: asyncio.subprocess.Process | None = None
+        self._encoder_pgid: int | None = None
 
-        self._pipeline_monitor_task: asyncio.Task[None] | None = None
-        self._producer_stderr_task: asyncio.Task[None] | None = None
-        self._consumer_stderr_task: asyncio.Task[None] | None = None
+        self._encoder_monitor_task: asyncio.Task[None] | None = None
+        self._encoder_stderr_task: asyncio.Task[None] | None = None
 
         self._audio_snapshot: dict[str, Any] | None = None
         self._audio_state_modified = False
@@ -136,10 +134,9 @@ class Plugin:
                 if pre_start_error is not None:
                     raise StartFailure(pre_start_error)
 
-                producer_command = self._build_producer_command(binary_path, normalized_config)
-                consumer_command = self._build_consumer_command(normalized_config)
+                encoder_command = self._build_encoder_command(binary_path, normalized_config)
 
-                spawn_error = await self._spawn_pipeline_locked(producer_command, consumer_command)
+                spawn_error = await self._spawn_pipeline_locked(encoder_command)
                 if spawn_error is not None:
                     raise StartFailure(spawn_error)
 
@@ -193,9 +190,8 @@ class Plugin:
             self._append_log(
                 "INFO",
                 (
-                    "Encoder pipeline running "
-                    f"producer_pid={self._active_producer_pid_locked()} "
-                    f"consumer_pid={self._active_consumer_pid_locked()}"
+                    "Encoder running "
+                    f"encoder_pid={self._active_encoder_pid_locked()}"
                 ),
             )
             return {
@@ -252,7 +248,7 @@ class Plugin:
                     "duration_ms": self._duration_ms(start),
                 }
 
-            stopped_pid = self._active_producer_pid_locked()
+            stopped_pid = self._active_encoder_pid_locked()
             if self._state != "stopped":
                 self._transition_locked("stopping")
                 await self._emit_state_changed_locked()
@@ -294,8 +290,7 @@ class Plugin:
             return {
                 "status": self._build_status_payload_locked(),
                 "pipeline": {
-                    "producer_pid": self._active_producer_pid_locked(),
-                    "consumer_pid": self._active_consumer_pid_locked(),
+                    "encoder_pid": self._active_encoder_pid_locked(),
                 },
                 "last_transition_at": self._last_transition_at,
             }
@@ -438,22 +433,31 @@ class Plugin:
                 hint="Use a positive integer.",
             )
 
-        aplay_buffer_time_us = config.get("aplay_buffer_time_us", DEFAULT_APLAY_BUFFER_TIME_US)
-        if not isinstance(aplay_buffer_time_us, int) or aplay_buffer_time_us <= 0:
+        alsa_latency_us = config.get("alsa_latency_us", DEFAULT_ALSA_LATENCY_US)
+        if not isinstance(alsa_latency_us, int) or alsa_latency_us <= 0:
             return None, self._make_error(
                 code="CONFIG_INVALID",
-                message="aplay_buffer_time_us must be > 0.",
-                detail=f"aplay_buffer_time_us={aplay_buffer_time_us!r}",
+                message="alsa_latency_us must be > 0.",
+                detail=f"alsa_latency_us={alsa_latency_us!r}",
                 hint="Use a positive integer.",
             )
 
-        aplay_period_time_us = config.get("aplay_period_time_us", DEFAULT_APLAY_PERIOD_TIME_US)
-        if not isinstance(aplay_period_time_us, int) or aplay_period_time_us <= 0:
+        alsa_iec_card = config.get("alsa_iec_card", DEFAULT_ALSA_IEC_CARD)
+        if not isinstance(alsa_iec_card, int) or alsa_iec_card < 0:
             return None, self._make_error(
                 code="CONFIG_INVALID",
-                message="aplay_period_time_us must be > 0.",
-                detail=f"aplay_period_time_us={aplay_period_time_us!r}",
-                hint="Use a positive integer.",
+                message="alsa_iec_card must be >= 0.",
+                detail=f"alsa_iec_card={alsa_iec_card!r}",
+                hint="Use a non-negative integer card index.",
+            )
+
+        alsa_iec_index = config.get("alsa_iec_index", DEFAULT_ALSA_IEC_INDEX)
+        if not isinstance(alsa_iec_index, int) or alsa_iec_index < 0:
+            return None, self._make_error(
+                code="CONFIG_INVALID",
+                message="alsa_iec_index must be >= 0.",
+                detail=f"alsa_iec_index={alsa_iec_index!r}",
+                hint="Use a non-negative integer IEC958 index.",
             )
 
         alsa_device = config.get("alsa_device", DEFAULT_ALSA_DEVICE)
@@ -475,20 +479,6 @@ class Plugin:
         if output_buffer_size_error is not None:
             return None, output_buffer_size_error
 
-        raw_extra_args = config.get("extra_args", [])
-        if not isinstance(raw_extra_args, list) or any(
-            not isinstance(arg, str) for arg in raw_extra_args
-        ):
-            return None, self._make_error(
-                code="CONFIG_INVALID",
-                message="extra_args must be a string array.",
-                detail=f"extra_args={raw_extra_args!r}",
-                hint="Use an array of strings.",
-            )
-        extra_args, extra_args_error = self._validate_extra_args(raw_extra_args)
-        if extra_args_error is not None:
-            return None, extra_args_error
-
         normalized = {
             "allow_external_binary_override": allow_external,
             "binary_path": binary_path.strip() if isinstance(binary_path, str) else None,
@@ -498,38 +488,11 @@ class Plugin:
             "output_buffer_size": output_buffer_size,
             "ffmpeg_thread_queue_size": ffmpeg_thread_queue_size,
             "ffmpeg_chunk_frames": ffmpeg_chunk_frames,
-            "aplay_buffer_time_us": aplay_buffer_time_us,
-            "aplay_period_time_us": aplay_period_time_us,
-            "extra_args": extra_args,
+            "alsa_latency_us": alsa_latency_us,
+            "alsa_iec_card": alsa_iec_card,
+            "alsa_iec_index": alsa_iec_index,
         }
         return normalized, None
-
-    def _validate_extra_args(
-        self,
-        extra_args: list[str],
-    ) -> tuple[list[str] | None, dict[str, Any] | None]:
-        normalized = [arg.strip() for arg in extra_args]
-        if any(not arg for arg in normalized):
-            return None, self._make_error(
-                code="CONFIG_INVALID",
-                message="extra_args cannot contain empty strings.",
-                detail=f"extra_args={extra_args!r}",
-                hint="Remove empty values from extra_args.",
-            )
-
-        if not normalized:
-            return [], None
-
-        # Direct ALSA profile is fully managed by explicit config fields.
-        return None, self._make_error(
-            code="CONFIG_INVALID",
-            message="extra_args are not allowed for this runtime profile.",
-            detail=f"extra_args={normalized!r}",
-            hint=(
-                "Use dedicated config fields: latency, buffer_size, "
-                "output_buffer_size, ffmpeg_thread_queue_size, ffmpeg_chunk_frames."
-            ),
-        )
 
     def _resolve_binary_path(self, config: dict[str, Any]) -> str:
         runtime_candidate = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, BUNDLED_BINARY_RELATIVE_PATH)
@@ -575,10 +538,18 @@ class Plugin:
             )
         )
 
-    def _build_producer_command(self, binary_path: str, config: dict[str, Any]) -> list[str]:
+    def _build_encoder_command(self, binary_path: str, config: dict[str, Any]) -> list[str]:
         command = [
             binary_path,
-            "--stdout",
+            "--alsa-direct",
+            "--target",
+            config["alsa_device"],
+            "--alsa-latency-us",
+            str(config["alsa_latency_us"]),
+            "--alsa-iec-card",
+            str(config["alsa_iec_card"]),
+            "--alsa-iec-index",
+            str(config["alsa_iec_index"]),
             "--latency",
             config["latency"],
             "--ffmpeg-thread-queue-size",
@@ -590,250 +561,92 @@ class Plugin:
             command.extend(["--buffer-size", str(config["buffer_size"])])
         if config["output_buffer_size"] is not None:
             command.extend(["--output-buffer-size", str(config["output_buffer_size"])])
-        if config["extra_args"]:
-            command.extend(config["extra_args"])
         return command
-
-    def _build_consumer_command(self, config: dict[str, Any]) -> list[str]:
-        return [
-            "aplay",
-            "-D",
-            config["alsa_device"],
-            "-t",
-            "raw",
-            "-f",
-            "S16_LE",
-            "-r",
-            "48000",
-            "-c",
-            "2",
-            f"--buffer-time={config['aplay_buffer_time_us']}",
-            f"--period-time={config['aplay_period_time_us']}",
-        ]
 
     async def _spawn_pipeline_locked(
         self,
-        producer_command: list[str],
-        consumer_command: list[str],
+        encoder_command: list[str],
     ) -> dict[str, Any] | None:
-        producer_cmd_str = self._command_display(producer_command)
-        consumer_cmd_str = self._command_display(consumer_command)
-        self._append_log("INFO", f"Starting producer: {producer_cmd_str}")
-        self._append_log("INFO", f"Starting consumer: {consumer_cmd_str}")
+        encoder_cmd_str = self._command_display(encoder_command)
+        self._append_log("INFO", f"Starting encoder: {encoder_cmd_str}")
 
-        producer: asyncio.subprocess.Process | None = None
-        consumer: asyncio.subprocess.Process | None = None
-        producer_pgid: int | None = None
-        consumer_pgid: int | None = None
+        encoder: asyncio.subprocess.Process | None = None
+        encoder_pgid: int | None = None
         subprocess_env = self._build_subprocess_env()
 
-        read_fd, write_fd = os.pipe()
         try:
-            try:
-                producer = await asyncio.create_subprocess_exec(
-                    *producer_command,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=write_fd,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=subprocess_env,
-                    preexec_fn=os.setsid,
-                )
-            except FileNotFoundError as exc:
-                return self._make_error(
-                    code="DEPENDENCY_MISSING",
-                    message="Producer binary is missing.",
-                    detail=f"command={producer_cmd_str} error={exc}",
-                    hint="Verify bundled pw-ac3-live binary exists and is executable.",
-                )
-            except PermissionError as exc:
-                return self._make_error(
-                    code="PERMISSION_DENIED",
-                    message="Producer process could not be spawned due to permissions.",
-                    detail=f"command={producer_cmd_str} error={exc}",
-                    hint="Check Decky plugin execution permissions.",
-                )
-            except Exception as exc:
-                return self._make_error(
-                    code="START_PROCESS_FAILED",
-                    message="Failed to spawn producer process.",
-                    detail=f"command={producer_cmd_str} error={exc}",
-                    hint="Check logs and command arguments.",
-                )
-
-            producer_pgid = os.getpgid(producer.pid)
-
-            def join_producer_group() -> None:
-                os.setpgid(0, producer_pgid)
-
-            try:
-                consumer = await asyncio.create_subprocess_exec(
-                    *consumer_command,
-                    stdin=read_fd,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=subprocess_env,
-                    preexec_fn=join_producer_group,
-                )
-                consumer_pgid = os.getpgid(consumer.pid)
-            except FileNotFoundError as exc:
-                await self._terminate_orphan_process_group(producer_pgid, producer)
-                return self._make_error(
-                    code="DEPENDENCY_MISSING",
-                    message="Consumer command is missing.",
-                    detail=f"command={consumer_cmd_str} error={exc}",
-                    hint="Ensure aplay is installed and available in PATH.",
-                )
-            except PermissionError as exc:
-                await self._terminate_orphan_process_group(producer_pgid, producer)
-                return self._make_error(
-                    code="PERMISSION_DENIED",
-                    message="Consumer process could not be spawned due to permissions.",
-                    detail=f"command={consumer_cmd_str} error={exc}",
-                    hint="Check Decky plugin execution permissions.",
-                )
-            except Exception as exc:
-                if not self._is_preexec_failure(exc):
-                    await self._terminate_orphan_process_group(producer_pgid, producer)
-                    return self._make_error(
-                        code="START_PROCESS_FAILED",
-                        message="Failed to spawn consumer process.",
-                        detail=f"command={consumer_cmd_str} error={exc}",
-                        hint="Check logs and command arguments.",
-                    )
-
-                self._append_log(
-                    "WARN",
-                    (
-                        "Consumer preexec join to producer group failed. "
-                        "Retrying with consumer in a dedicated process group. "
-                        f"error={exc}"
-                    ),
-                )
-                try:
-                    consumer = await asyncio.create_subprocess_exec(
-                        *consumer_command,
-                        stdin=read_fd,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.PIPE,
-                        env=subprocess_env,
-                        preexec_fn=os.setsid,
-                    )
-                    consumer_pgid = os.getpgid(consumer.pid)
-                except FileNotFoundError as fallback_exc:
-                    await self._terminate_orphan_process_group(producer_pgid, producer)
-                    return self._make_error(
-                        code="DEPENDENCY_MISSING",
-                        message="Consumer command is missing.",
-                        detail=f"command={consumer_cmd_str} error={fallback_exc}",
-                        hint="Ensure aplay is installed and available in PATH.",
-                    )
-                except PermissionError as fallback_exc:
-                    await self._terminate_orphan_process_group(producer_pgid, producer)
-                    return self._make_error(
-                        code="PERMISSION_DENIED",
-                        message="Consumer process could not be spawned due to permissions.",
-                        detail=f"command={consumer_cmd_str} error={fallback_exc}",
-                        hint="Check Decky plugin execution permissions.",
-                    )
-                except Exception as fallback_exc:
-                    await self._terminate_orphan_process_group(producer_pgid, producer)
-                    return self._make_error(
-                        code="START_PROCESS_FAILED",
-                        message="Failed to spawn consumer process.",
-                        detail=f"command={consumer_cmd_str} error={fallback_exc}",
-                        hint="Check logs and command arguments.",
-                    )
-
-        finally:
-            with contextlib.suppress(OSError):
-                os.close(read_fd)
-            with contextlib.suppress(OSError):
-                os.close(write_fd)
-
-        self._producer_process = producer
-        self._consumer_process = consumer
-        self._pipeline_pgid = producer_pgid
-        self._consumer_pgid = consumer_pgid
-
-        if producer is not None and producer.stderr is not None:
-            self._producer_stderr_task = asyncio.create_task(
-                self._consume_stream(producer.stderr, "producer-stderr", producer.pid),
-                name=f"pw-ac3-live-producer-stderr-{producer.pid}",
+            encoder = await asyncio.create_subprocess_exec(
+                *encoder_command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=subprocess_env,
+                preexec_fn=os.setsid,
+            )
+        except FileNotFoundError as exc:
+            return self._make_error(
+                code="DEPENDENCY_MISSING",
+                message="Encoder binary is missing.",
+                detail=f"command={encoder_cmd_str} error={exc}",
+                hint="Verify bundled pw-ac3-live binary exists and is executable.",
+            )
+        except PermissionError as exc:
+            return self._make_error(
+                code="PERMISSION_DENIED",
+                message="Encoder process could not be spawned due to permissions.",
+                detail=f"command={encoder_cmd_str} error={exc}",
+                hint="Check Decky plugin execution permissions.",
+            )
+        except Exception as exc:
+            return self._make_error(
+                code="START_PROCESS_FAILED",
+                message="Failed to spawn encoder process.",
+                detail=f"command={encoder_cmd_str} error={exc}",
+                hint="Check logs and command arguments.",
             )
 
-        if consumer is not None and consumer.stderr is not None:
-            self._consumer_stderr_task = asyncio.create_task(
-                self._consume_stream(consumer.stderr, "consumer-stderr", consumer.pid),
-                name=f"pw-ac3-live-consumer-stderr-{consumer.pid}",
+        encoder_pgid = os.getpgid(encoder.pid)
+        self._encoder_process = encoder
+        self._encoder_pgid = encoder_pgid
+
+        if encoder.stderr is not None:
+            self._encoder_stderr_task = asyncio.create_task(
+                self._consume_stream(encoder.stderr, "encoder-stderr", encoder.pid),
+                name=f"pw-ac3-live-encoder-stderr-{encoder.pid}",
             )
 
-        self._pipeline_monitor_task = asyncio.create_task(
-            self._watch_pipeline_exit(producer.pid, consumer.pid),
-            name=f"pw-ac3-live-monitor-{producer.pid}-{consumer.pid}",
+        self._encoder_monitor_task = asyncio.create_task(
+            self._watch_pipeline_exit(encoder.pid),
+            name=f"pw-ac3-live-monitor-{encoder.pid}",
         )
 
         self._append_log(
             "INFO",
             (
-                "Pipeline spawned "
-                f"producer_pid={producer.pid} producer_pgid={producer_pgid} "
-                f"consumer_pid={consumer.pid} consumer_pgid={consumer_pgid}"
+                "Encoder process spawned "
+                f"encoder_pid={encoder.pid} encoder_pgid={encoder_pgid}"
             ),
         )
         return None
 
-    async def _watch_pipeline_exit(self, producer_pid: int, consumer_pid: int) -> None:
-        producer = self._producer_process
-        consumer = self._consumer_process
-        if producer is None or consumer is None:
+    async def _watch_pipeline_exit(self, encoder_pid: int) -> None:
+        encoder = self._encoder_process
+        if encoder is None:
             return
-        if producer.pid != producer_pid or consumer.pid != consumer_pid:
+        if encoder.pid != encoder_pid:
             return
 
-        producer_wait = asyncio.create_task(producer.wait(), name=f"wait-producer-{producer_pid}")
-        consumer_wait = asyncio.create_task(consumer.wait(), name=f"wait-consumer-{consumer_pid}")
-
-        done, pending = await asyncio.wait(
-            {producer_wait, consumer_wait},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        first_exit = "producer" if producer_wait in done else "consumer"
-
-        if first_exit == "consumer":
-            self._append_log(
-                "WARN",
-                f"Consumer exited first (pid={consumer_pid}). Terminating producer immediately.",
-            )
-            await self._terminate_single_process(producer, drain_s=0.1)
-        else:
-            self._append_log(
-                "WARN",
-                (
-                    f"Producer exited first (pid={producer_pid}). "
-                    "Allowing 500ms drain window before stopping consumer."
-                ),
-            )
-            await asyncio.sleep(0.5)
-            await self._terminate_single_process(consumer, drain_s=0.1)
-
-        for task in pending:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-
-        producer_rc = producer.returncode
-        consumer_rc = consumer.returncode
+        encoder_rc = await encoder.wait()
 
         async with self._lifecycle_lock:
-            if not self._pipeline_matches_locked(producer_pid, consumer_pid):
+            if not self._pipeline_matches_locked(encoder_pid):
                 return
 
             self._append_log(
                 "ERROR",
                 (
-                    "Pipeline exited unexpectedly "
-                    f"producer_pid={producer_pid} producer_rc={producer_rc} "
-                    f"consumer_pid={consumer_pid} consumer_rc={consumer_rc}"
+                    "Encoder process exited unexpectedly "
+                    f"encoder_pid={encoder_pid} encoder_rc={encoder_rc}"
                 ),
             )
             await self._clear_pipeline_handles_locked()
@@ -841,11 +654,8 @@ class Plugin:
             if self._state in {"running", "starting"}:
                 error = self._make_error(
                     code="PIPELINE_BROKEN",
-                    message="Encoder pipeline exited unexpectedly.",
-                    detail=(
-                        f"producer_pid={producer_pid} producer_rc={producer_rc}; "
-                        f"consumer_pid={consumer_pid} consumer_rc={consumer_rc}"
-                    ),
+                    message="Encoder process exited unexpectedly.",
+                    detail=f"encoder_pid={encoder_pid} encoder_rc={encoder_rc}",
                     hint="Inspect recent logs and restart encoder.",
                 )
                 self._last_error = error
@@ -857,29 +667,6 @@ class Plugin:
             if self._state == "stopping":
                 self._transition_locked("stopped")
                 await self._emit_state_changed_locked()
-
-    async def _terminate_single_process(
-        self,
-        process: asyncio.subprocess.Process,
-        drain_s: float,
-    ) -> None:
-        if process.returncode is not None:
-            return
-
-        with contextlib.suppress(ProcessLookupError):
-            process.terminate()
-
-        try:
-            await asyncio.wait_for(process.wait(), timeout=drain_s)
-            return
-        except asyncio.TimeoutError:
-            pass
-
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
-
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(process.wait(), timeout=1.0)
 
     async def _capture_audio_snapshot_locked(
         self,
@@ -1171,7 +958,7 @@ class Plugin:
             code="START_PROCESS_FAILED",
             message="pw-ac3-live-input sink did not appear in time.",
             detail=f"sink={sink_name} timeout_s={timeout_s}",
-            hint="Check pw-ac3-live producer logs and PipeWire state.",
+            hint="Check pw-ac3-live encoder logs and PipeWire state.",
         )
 
     async def _execute_cleanup_locked(
@@ -1321,18 +1108,18 @@ class Plugin:
             await self._clear_pipeline_handles_locked()
             return None
 
-        producer_pid = self._active_producer_pid_locked()
-        if producer_pid is None:
+        encoder_pid = self._active_encoder_pid_locked()
+        if encoder_pid is None:
             await self._clear_pipeline_handles_locked()
             return None
 
-        pgid, ownership_error = self._resolve_owned_pgid_locked(producer_pid)
+        pgid, ownership_error = self._resolve_owned_pgid_locked(encoder_pid)
         if ownership_error is not None:
             return ownership_error
         if pgid is None:
             await self._clear_pipeline_handles_locked()
             return None
-        pgids, collect_error = self._collect_pipeline_pgids_locked(producer_pgid=pgid)
+        pgids, collect_error = self._collect_encoder_pgids_locked(encoder_pgid=pgid)
         if collect_error is not None:
             return collect_error
 
@@ -1389,10 +1176,8 @@ class Plugin:
 
     async def _wait_for_pipeline_exit_locked(self, timeout_s: float) -> bool:
         waits: list[asyncio.Task[int]] = []
-        if self._producer_process is not None and self._producer_process.returncode is None:
-            waits.append(asyncio.create_task(self._producer_process.wait()))
-        if self._consumer_process is not None and self._consumer_process.returncode is None:
-            waits.append(asyncio.create_task(self._consumer_process.wait()))
+        if self._encoder_process is not None and self._encoder_process.returncode is None:
+            waits.append(asyncio.create_task(self._encoder_process.wait()))
 
         if not waits:
             return True
@@ -1411,18 +1196,14 @@ class Plugin:
                     await task
 
     async def _clear_pipeline_handles_locked(self) -> None:
-        await self._cancel_task_locked(self._producer_stderr_task)
-        await self._cancel_task_locked(self._consumer_stderr_task)
-        await self._cancel_task_locked(self._pipeline_monitor_task)
+        await self._cancel_task_locked(self._encoder_stderr_task)
+        await self._cancel_task_locked(self._encoder_monitor_task)
 
-        self._producer_stderr_task = None
-        self._consumer_stderr_task = None
-        self._pipeline_monitor_task = None
+        self._encoder_stderr_task = None
+        self._encoder_monitor_task = None
 
-        self._producer_process = None
-        self._consumer_process = None
-        self._pipeline_pgid = None
-        self._consumer_pgid = None
+        self._encoder_process = None
+        self._encoder_pgid = None
 
     async def _cancel_task_locked(self, task: asyncio.Task[None] | None) -> None:
         if task is None or task.done():
@@ -1457,18 +1238,6 @@ class Plugin:
             message = raw.decode(errors="replace").rstrip()
             if message:
                 self._append_log("INFO", f"{stream_name}[{pid}]: {message}")
-
-    async def _terminate_orphan_process_group(
-        self,
-        pgid: int | None,
-        process: asyncio.subprocess.Process | None,
-    ) -> None:
-        if pgid is not None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(pgid, signal.SIGKILL)
-        if process is not None:
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(process.wait(), timeout=2.0)
 
     async def _run_command(
         self,
@@ -1561,9 +1330,8 @@ class Plugin:
         ok = returncode == 0
         error: dict[str, Any] | None = None
         if not ok and check:
-            error_code = "DEVICE_UNAVAILABLE" if command and command[0] == "aplay" else "START_PROCESS_FAILED"
             error = self._make_error(
-                code=error_code,
+                code="START_PROCESS_FAILED",
                 message="Command returned a non-zero exit code.",
                 detail=(
                     f"command={command_display} returncode={returncode} "
@@ -1692,100 +1460,58 @@ class Plugin:
     def _build_status_payload_locked(self) -> dict[str, Any]:
         return {
             "state": self._state,
-            "pid": self._active_producer_pid_locked(),
+            "pid": self._active_encoder_pid_locked(),
             "started_at": self._started_at,
             "last_error": self._last_error,
         }
 
     def _pipeline_is_alive_locked(self) -> bool:
-        return self._active_producer_pid_locked() is not None or self._active_consumer_pid_locked() is not None
+        return self._active_encoder_pid_locked() is not None
 
-    def _active_producer_pid_locked(self) -> int | None:
-        if self._producer_process is None:
+    def _active_encoder_pid_locked(self) -> int | None:
+        if self._encoder_process is None:
             return None
-        if self._producer_process.returncode is not None:
+        if self._encoder_process.returncode is not None:
             return None
-        return self._producer_process.pid
+        return self._encoder_process.pid
 
-    def _active_consumer_pid_locked(self) -> int | None:
-        if self._consumer_process is None:
-            return None
-        if self._consumer_process.returncode is not None:
-            return None
-        return self._consumer_process.pid
-
-    def _pipeline_matches_locked(self, producer_pid: int, consumer_pid: int) -> bool:
-        if self._producer_process is None or self._consumer_process is None:
+    def _pipeline_matches_locked(self, encoder_pid: int) -> bool:
+        if self._encoder_process is None:
             return False
-        return self._producer_process.pid == producer_pid and self._consumer_process.pid == consumer_pid
+        return self._encoder_process.pid == encoder_pid
 
-    def _resolve_owned_pgid_locked(self, producer_pid: int) -> tuple[int | None, dict[str, Any] | None]:
+    def _resolve_owned_pgid_locked(self, encoder_pid: int) -> tuple[int | None, dict[str, Any] | None]:
         observed_pgid: int | None = None
         with contextlib.suppress(ProcessLookupError):
-            observed_pgid = os.getpgid(producer_pid)
+            observed_pgid = os.getpgid(encoder_pid)
 
         if observed_pgid is None:
-            return self._pipeline_pgid, None
+            return self._encoder_pgid, None
 
-        if self._pipeline_pgid is None:
-            self._pipeline_pgid = observed_pgid
+        if self._encoder_pgid is None:
+            self._encoder_pgid = observed_pgid
             return observed_pgid, None
 
-        if observed_pgid != self._pipeline_pgid:
+        if observed_pgid != self._encoder_pgid:
             return None, self._make_error(
                 code="PIPELINE_BROKEN",
                 message="Managed process-group ownership changed unexpectedly.",
                 detail=(
-                    f"producer_pid={producer_pid} "
-                    f"expected_pgid={self._pipeline_pgid} actual_pgid={observed_pgid}"
+                    f"encoder_pid={encoder_pid} "
+                    f"expected_pgid={self._encoder_pgid} actual_pgid={observed_pgid}"
                 ),
                 hint="Do not reuse external processes; restart encoder.",
             )
 
         return observed_pgid, None
 
-    def _resolve_consumer_pgid_locked(self) -> tuple[int | None, dict[str, Any] | None]:
-        consumer_pid = self._active_consumer_pid_locked()
-        observed_pgid: int | None = None
-        if consumer_pid is not None:
-            with contextlib.suppress(ProcessLookupError):
-                observed_pgid = os.getpgid(consumer_pid)
-
-        if observed_pgid is None:
-            return self._consumer_pgid, None
-
-        if self._consumer_pgid is None:
-            self._consumer_pgid = observed_pgid
-            return observed_pgid, None
-
-        if observed_pgid != self._consumer_pgid:
-            return None, self._make_error(
-                code="PIPELINE_BROKEN",
-                message="Consumer process-group ownership changed unexpectedly.",
-                detail=(
-                    f"consumer_pid={consumer_pid} "
-                    f"expected_pgid={self._consumer_pgid} actual_pgid={observed_pgid}"
-                ),
-                hint="Restart encoder to recreate a clean pipeline.",
-            )
-
-        return observed_pgid, None
-
-    def _collect_pipeline_pgids_locked(
+    def _collect_encoder_pgids_locked(
         self,
-        producer_pgid: int | None,
+        encoder_pgid: int | None,
     ) -> tuple[list[int], dict[str, Any] | None]:
-        pgids: list[int] = []
-        if producer_pgid is not None:
-            pgids.append(producer_pgid)
-
-        consumer_pgid, consumer_error = self._resolve_consumer_pgid_locked()
-        if consumer_error is not None:
-            return [], consumer_error
-        if consumer_pgid is not None and consumer_pgid not in pgids:
-            pgids.append(consumer_pgid)
-
-        return pgids, None
+        if encoder_pgid is None:
+            return [], None
+        return [encoder_pgid], None
 
     def _send_signal_to_groups(
         self,
@@ -1950,10 +1676,6 @@ class Plugin:
             if parts[1] == sink_name:
                 return True
         return False
-
-    @staticmethod
-    def _is_preexec_failure(exc: Exception) -> bool:
-        return "preexec_fn" in str(exc).lower()
 
     @staticmethod
     def _is_missing_amixer_control(command_result: dict[str, Any]) -> bool:

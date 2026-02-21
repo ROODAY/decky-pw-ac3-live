@@ -20,7 +20,7 @@ Deliver a production-ready Decky Loader plugin that controls `pw-ac3-live` on St
 ## Supported Platform
 - Steam Deck OLED only.
 - SteamOS stable channel only.
-- Direct ALSA output path only (`--stdout | aplay`).
+- Direct ALSA output path only (`--alsa-direct --target hw:0,8`).
 
 ## Current State
 - Frontend and backend template plumbing is present.
@@ -51,7 +51,7 @@ Milestone tracker:
 | Milestone | Status | Owner | Target Finish | Evidence |
 | --- | --- | --- | --- | --- |
 | M1 Backend process supervisor | done | Codex | TBD | `main.py` lifecycle supervisor + APIs implemented; local gates passed (`pnpm run build`, `python -m py_compile`, JSON validation, mocked backend smoke for start/stop + duplicate-start + `START_PROCESS_FAILED` + `PIPELINE_BROKEN`) |
-| M2 Steam Deck runtime integration | done | Codex | TBD | `main.py` Deck pipeline + cleanup/restore integrated and hardened; local compile/build + mocked smoke passed; Steam Deck validation confirmed (start/stop, no orphan `pw-ac3-live|aplay`, expected sink/profile restore behavior) |
+| M2 Steam Deck runtime integration | done | Codex | TBD | `main.py` direct ALSA startup + cleanup/restore integrated and hardened; local compile/build + mocked smoke passed; Steam Deck validation confirmed (start/stop, no orphan `pw-ac3-live`, expected sink/profile restore behavior) |
 | M3 Frontend controls and status UX | done | Codex | TBD | `src/index.tsx` typed controls/events implemented; local build gates passed; Steam Deck UI validation confirmed (controls, transition locking, status refresh, toasts/errors) |
 | M4 Diagnostics and recovery | not_started | TBD | TBD | TBD |
 | M5 Release hardening | not_started | TBD | TBD | TBD |
@@ -88,11 +88,10 @@ Implementation tasks:
   - HDMI card: `alsa_card.pci-0000_04_00.1`
   - Internal speaker card: `alsa_card.pci-0000_04_00.5-platform-nau8821-max`
   - ALSA device: `hw:0,8`
-- Implement Deck launch pipeline with explicit subprocesses:
-  - producer: `pw-ac3-live --stdout --latency 1536/48000 --ffmpeg-thread-queue-size 4 --ffmpeg-chunk-frames 1536`
-  - consumer: `aplay -D hw:0,8 -t raw -f S16_LE -r 48000 -c 2 --buffer-time=60000 --period-time=15000`
+- Implement Deck launch path with direct ALSA output:
+  - `pw-ac3-live --alsa-direct --target hw:0,8 --alsa-latency-us 60000 --alsa-iec-card 0 --alsa-iec-index 2 --latency 1536/48000 --ffmpeg-thread-queue-size 4 --ffmpeg-chunk-frames 1536`
 - Snapshot audio state before start (default sink/profile + IEC958 relevant bits).
-- Apply Steam Deck pre-start actions before pipeline launch:
+- Apply Steam Deck pre-start actions before encoder launch:
   - `pactl set-card-profile alsa_card.pci-0000_04_00.1 off`
   - `iecset -c 0 -n 2 audio off rate 48000`
   - `amixer -c 0 set Master/PCM unmute 100%` and `IEC958,2` unmute
@@ -130,7 +129,7 @@ Exit criteria:
 ### M4 - Diagnostics and recovery
 Implementation tasks:
 - Add backend health checks:
-  - required dependency availability (`ffmpeg`, `aplay`, `pactl`, `pw-cli`, `pw-link`, `iecset`, `amixer`, `wpctl`, `pw-metadata`)
+  - required dependency availability (`ffmpeg`, `pactl`, `pw-cli`, `pw-link`, `iecset`, `amixer`, `wpctl`, `pw-metadata`)
   - binary executable validation
   - output path/device sanity checks
 - Add one-click recovery callables:
@@ -195,9 +194,9 @@ Exit criteria:
 - `output_buffer_size`: `number | null` (maps to `--output-buffer-size`)
 - `ffmpeg_thread_queue_size`: `number` (default `4` on Steam Deck path)
 - `ffmpeg_chunk_frames`: `number` (default `1536` on Steam Deck path)
-- `aplay_buffer_time_us`: `number` (default `60000`)
-- `aplay_period_time_us`: `number` (default `15000`)
-- `extra_args`: `string[]` (default `[]`, optional pass-through for known-safe flags only)
+- `alsa_latency_us`: `number` (default `60000`)
+- `alsa_iec_card`: `number` (default `0`)
+- `alsa_iec_index`: `number` (default `2`)
 
 `start_encoder` response:
 - `ok`: `boolean`
@@ -213,7 +212,7 @@ Exit criteria:
 
 `get_status()` response:
 - `status`: status payload
-- `pipeline`: `{ producer_pid: number | null, consumer_pid: number | null }`
+- `pipeline`: `{ encoder_pid: number | null }`
 - `last_transition_at`: ISO timestamp
 
 `get_recent_logs(limit=200, since_seq=null)` response:
@@ -250,11 +249,11 @@ Events:
 - `BINARY_NOT_FOUND`: debug override path does not resolve to executable.
 - `HEALTHCHECK_FAILED`: one or more required runtime checks failed.
 - `RESUME_RESTART_SKIPPED`: resume detected but restart skipped because health checks failed.
-- `DEPENDENCY_MISSING`: required command unavailable (`aplay`, `pactl`, etc.).
+- `DEPENDENCY_MISSING`: required command unavailable (`pactl`, `iecset`, etc.).
 - `DEVICE_UNAVAILABLE`: ALSA target unavailable or busy.
 - `START_REJECTED_STATE`: start called outside `stopped`/`error` state.
-- `START_PROCESS_FAILED`: producer or consumer failed to spawn.
-- `PIPELINE_BROKEN`: producer/consumer exited unexpectedly during runtime.
+- `START_PROCESS_FAILED`: encoder process failed to spawn.
+- `PIPELINE_BROKEN`: encoder process exited unexpectedly during runtime.
 - `STOP_REJECTED_STATE`: stop called while already `stopped`.
 - `STOP_TIMEOUT`: process group did not terminate within timeout budget.
 - `AUDIO_SNAPSHOT_FAILED`: unable to capture pre-start audio state.
@@ -272,9 +271,9 @@ Persisted settings keys:
 - `output_buffer_size`: `number | null`
 - `ffmpeg_thread_queue_size`: `number`
 - `ffmpeg_chunk_frames`: `number`
-- `aplay_buffer_time_us`: `number`
-- `aplay_period_time_us`: `number`
-- `extra_args`: `string[]`
+- `alsa_latency_us`: `number`
+- `alsa_iec_card`: `number`
+- `alsa_iec_index`: `number`
 - `log_lines`: `number`
 - `auto_recover_on_start`: `boolean`
 - `auto_restart_after_resume`: `boolean`
@@ -283,7 +282,8 @@ Validation rules:
 - `latency` must match `N/48000` format.
 - `ffmpeg_thread_queue_size >= 1`.
 - `ffmpeg_chunk_frames >= 1`.
-- `aplay_buffer_time_us > 0` and `aplay_period_time_us > 0`.
+- `alsa_latency_us > 0`.
+- `alsa_iec_card >= 0` and `alsa_iec_index >= 0`.
 - `log_lines` range: `200..5000`.
 - `binary_path_override` must resolve to executable file if set.
 - `binary_path_override` is ignored unless `allow_external_binary_override=true`.
@@ -313,9 +313,8 @@ Bundled encoder artifact layout:
   - if still alive, send `SIGKILL`
   - wait hard timeout (`2000ms`)
   - if still alive, emit `STOP_TIMEOUT` and set `error` state
-- If consumer (`aplay`) exits first, terminate producer immediately and mark `PIPELINE_BROKEN`.
-- If producer exits first, allow short drain window (`<=500ms`) then stop consumer.
-- Always store producer/consumer exit codes in recent logs.
+- If encoder exits unexpectedly while running, mark `PIPELINE_BROKEN`.
+- Always store encoder exit code in recent logs.
 
 ### Audio snapshot and restore contract
 Before startup, capture:
@@ -369,12 +368,12 @@ Manual Steam Deck validation:
   - suspend/resume while running (must stop before suspend and restart after resume only when health checks pass)
   - audio device busy at startup
 - Regression:
-  - Ensure no stale `pw-ac3-live` or `aplay` children
+  - Ensure no stale `pw-ac3-live` children
   - Confirm sink/profile restoration after stop
 
 Manual validation commands and pass criteria:
 - Process hygiene:
-  - command: `pgrep -fa "pw-ac3-live|aplay"`
+  - command: `pgrep -fa "pw-ac3-live"`
   - pass: no plugin-owned processes remain within 5 seconds after stop/unload.
 - Sink restoration:
   - command: `pactl get-default-sink` (capture before start and after stop)
