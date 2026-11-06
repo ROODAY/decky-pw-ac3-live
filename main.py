@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import datetime as dt
 import glob
 import json
@@ -72,6 +73,38 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 DISPLAY_POLL_INTERVAL_S = 2.0
 RESUME_SETTLE_S = 3.0
 AUTO_RETRY_BACKOFF_S = (5.0, 15.0, 30.0)
+
+# Helper processes (sleep inhibitor, logind monitor). plugin_loader.service uses KillMode=process, so when
+# Decky restarts, children of the backend are NOT killed; they must die with us on their own.
+SLEEP_INHIBIT_WHY = "Stop the AC-3 encoder cleanly before sleep"
+SLEEP_INHIBIT_ARGS = (
+    "systemd-inhibit",
+    "--what=sleep",
+    "--mode=delay",
+    "--who=pw-ac3-live",
+    f"--why={SLEEP_INHIBIT_WHY}",
+)
+# Held command: exits by itself when the backend dies (same trick SteamOS uses for SSH sessions),
+# which makes systemd-inhibit exit and release the lock.
+def _inhibit_hold_command() -> tuple[str, ...]:
+    return ("tail", f"--pid={os.getpid()}", "-f", "/dev/null")
+
+SLEEP_MONITOR_ARGS = (
+    "gdbus",
+    "monitor",
+    "--system",
+    "--dest",
+    "org.freedesktop.login1",
+    "--object-path",
+    "/org/freedesktop/login1",
+)
+_PR_SET_PDEATHSIG = 1
+
+
+def _die_with_parent() -> None:
+    """preexec_fn: have the kernel SIGTERM this child when the backend dies (even via SIGKILL)."""
+    with contextlib.suppress(Exception):
+        ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
 
 BUNDLED_BINARY_RELATIVE_PATH = os.path.join("bin", "pw-ac3-live")
 
@@ -723,17 +756,13 @@ class Plugin:
             return
         try:
             self._inhibitor_proc = await asyncio.create_subprocess_exec(
-                "systemd-inhibit",
-                "--what=sleep",
-                "--mode=delay",
-                "--who=pw-ac3-live",
-                "--why=Stop the AC-3 encoder cleanly before sleep",
-                "sleep",
-                "infinity",
+                *SLEEP_INHIBIT_ARGS,
+                *_inhibit_hold_command(),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
                 start_new_session=True,
+                preexec_fn=_die_with_parent,
                 env=self._build_subprocess_env(),
             )
         except Exception as exc:
@@ -757,16 +786,11 @@ class Plugin:
         while True:
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    "gdbus",
-                    "monitor",
-                    "--system",
-                    "--dest",
-                    "org.freedesktop.login1",
-                    "--object-path",
-                    "/org/freedesktop/login1",
+                    *SLEEP_MONITOR_ARGS,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL,
+                    preexec_fn=_die_with_parent,
                 )
                 self._sleep_monitor_proc = proc
                 assert proc.stdout is not None
@@ -803,6 +827,34 @@ class Plugin:
             self._reset_auto_retry()
             await self._acquire_sleep_inhibitor()
 
+    def _kill_orphaned_helpers(self) -> None:
+        """Kill helper processes leaked by a previous backend instance (re-parented to PID 1)."""
+        inhibit_prefix = "\0".join(SLEEP_INHIBIT_ARGS) + "\0"
+        monitor_cmdline = "\0".join(SLEEP_MONITOR_ARGS)
+        uid = os.getuid()
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                    cmdline = handle.read().rstrip(b"\0").decode(errors="replace")
+                if not (cmdline.startswith(inhibit_prefix) or cmdline == monitor_cmdline):
+                    continue
+                st = os.stat(f"/proc/{entry}")
+                with open(f"/proc/{entry}/stat", encoding="utf-8") as handle:
+                    ppid = int(handle.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            if st.st_uid != uid or ppid != 1:
+                continue
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                # systemd-inhibit is a session leader (start_new_session): take its held child with it.
+                if cmdline.startswith(inhibit_prefix) and os.getpgid(int(entry)) == int(entry):
+                    os.killpg(int(entry), signal.SIGTERM)
+                else:
+                    os.kill(int(entry), signal.SIGTERM)
+                self._append_log("INFO", f"Killed orphaned helper from a previous instance: pid={entry} {cmdline.split(chr(0))[0]}")
+
     async def _stop_automation(self) -> None:
         for task in (self._display_task, self._sleep_task):
             if task is not None:
@@ -823,6 +875,7 @@ class Plugin:
         self.loop = asyncio.get_event_loop()
         self._append_log("INFO", "pw-ac3-live backend loaded")
         self._load_settings()
+        self._kill_orphaned_helpers()
         async with self._lifecycle_lock:
             await self._emit_state_changed_locked()
         await self._acquire_sleep_inhibitor()
