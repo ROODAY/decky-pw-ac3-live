@@ -101,6 +101,11 @@ SLEEP_MONITOR_ARGS = (
 _PR_SET_PDEATHSIG = 1
 
 
+def _setsid_and_die_with_parent() -> None:
+    os.setsid()
+    _die_with_parent()
+
+
 def _die_with_parent() -> None:
     """preexec_fn: have the kernel SIGTERM this child when the backend dies (even via SIGKILL)."""
     with contextlib.suppress(Exception):
@@ -827,8 +832,12 @@ class Plugin:
             self._reset_auto_retry()
             await self._acquire_sleep_inhibitor()
 
-    def _kill_orphaned_helpers(self) -> None:
-        """Kill helper processes leaked by a previous backend instance (re-parented to PID 1)."""
+    def _kill_orphaned_helpers(self) -> list[int]:
+        """Kill helper processes leaked by a previous backend instance (re-parented to PID 1).
+
+        Returns the PIDs of orphaned encoders that were signalled (their audio changes need restoring).
+        """
+        killed_encoders: list[int] = []
         inhibit_prefix = "\0".join(SLEEP_INHIBIT_ARGS) + "\0"
         monitor_cmdline = "\0".join(SLEEP_MONITOR_ARGS)
         uid = os.getuid()
@@ -838,7 +847,9 @@ class Plugin:
             try:
                 with open(f"/proc/{entry}/cmdline", "rb") as handle:
                     cmdline = handle.read().rstrip(b"\0").decode(errors="replace")
-                if not (cmdline.startswith(inhibit_prefix) or cmdline == monitor_cmdline):
+                args = cmdline.split("\0")
+                is_encoder = args[0].endswith("/pw-ac3-live") and "--alsa-direct" in args
+                if not (cmdline.startswith(inhibit_prefix) or cmdline == monitor_cmdline or is_encoder):
                     continue
                 st = os.stat(f"/proc/{entry}")
                 with open(f"/proc/{entry}/stat", encoding="utf-8") as handle:
@@ -849,11 +860,34 @@ class Plugin:
                 continue
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 # systemd-inhibit is a session leader (start_new_session): take its held child with it.
-                if cmdline.startswith(inhibit_prefix) and os.getpgid(int(entry)) == int(entry):
+                if (cmdline.startswith(inhibit_prefix) or is_encoder) and os.getpgid(int(entry)) == int(entry):
                     os.killpg(int(entry), signal.SIGTERM)
                 else:
                     os.kill(int(entry), signal.SIGTERM)
-                self._append_log("INFO", f"Killed orphaned helper from a previous instance: pid={entry} {cmdline.split(chr(0))[0]}")
+                if is_encoder:
+                    killed_encoders.append(int(entry))
+                self._append_log("INFO", f"Killed orphaned helper from a previous instance: pid={entry} {args[0]}")
+        return killed_encoders
+
+    async def _restore_after_orphaned_encoder(self, pids: list[int]) -> None:
+        """An encoder from a previous instance was running: wait for it, then undo its audio changes."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
+        while loop.time() < deadline and any(os.path.exists(f"/proc/{pid}") for pid in pids):
+            await asyncio.sleep(0.1)
+        for pid in pids:
+            if os.path.exists(f"/proc/{pid}"):
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
+        hdmi_sink = DECK_HDMI_CARD.replace("alsa_card.", "alsa_output.", 1) + "." + DECK_HDMI_DEFAULT_PROFILE.split(":", 1)[1]
+        for command in (
+            ["iecset", "-c", "0", "-n", "2", "audio", "on"],
+            ["pactl", "set-card-profile", DECK_HDMI_CARD, DECK_HDMI_DEFAULT_PROFILE],
+        ):
+            await self._run_command(command, timeout_s=5.0, check=False)
+        await asyncio.sleep(0.5)
+        await self._run_command(["pactl", "set-default-sink", hdmi_sink], timeout_s=5.0, check=False)
+        self._append_log("INFO", f"Restored HDMI audio after orphaned encoder (default sink {hdmi_sink}).")
 
     async def _stop_automation(self) -> None:
         for task in (self._display_task, self._sleep_task):
@@ -875,7 +909,9 @@ class Plugin:
         self.loop = asyncio.get_event_loop()
         self._append_log("INFO", "pw-ac3-live backend loaded")
         self._load_settings()
-        self._kill_orphaned_helpers()
+        orphaned_encoders = self._kill_orphaned_helpers()
+        if orphaned_encoders:
+            await self._restore_after_orphaned_encoder(orphaned_encoders)
         async with self._lifecycle_lock:
             await self._emit_state_changed_locked()
         await self._acquire_sleep_inhibitor()
@@ -1140,7 +1176,9 @@ class Plugin:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
                 env=subprocess_env,
-                preexec_fn=os.setsid,
+                # Own process group (for clean group termination) + SIGTERM if the backend dies, so a
+                # Decky restart (KillMode=process) can't leave an unmanaged encoder holding hw:0,8.
+                preexec_fn=_setsid_and_die_with_parent,
             )
         except FileNotFoundError as exc:
             return self._make_error(
