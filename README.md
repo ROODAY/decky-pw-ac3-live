@@ -1,6 +1,6 @@
-# decky-pw-ac3-live
+# Surround Sound Fix (decky-pw-ac3-live)
 
-Decky Loader plugin for controlling `pw-ac3-live` (real-time 5.1 PCM -> AC-3 encoder) on Steam Deck.
+Decky Loader plugin that gives Steam Deck real 5.1 surround over HDMI by encoding game audio to Dolby Digital (AC-3) in real time with `pw-ac3-live`. For TVs, soundbars and receivers that accept Dolby Digital but only stereo PCM.
 
 Plugin releases are intended to bundle the `pw-ac3-live` executable so users do not need to install it separately.
 
@@ -105,7 +105,7 @@ pnpm run watch
 
 ## Plugin Identity
 
-- Plugin name: `pw-ac3-live`
+- Plugin name: `Surround Sound Fix` (install folder and settings/logs dir stay `pw-ac3-live`)
 - Package name: `decky-pw-ac3-live`
 - Author: `Alexandre Poux`
 - API version: `1`

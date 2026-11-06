@@ -713,7 +713,7 @@ class Plugin:
             self._auto_retry_count += 1
             self._want_running = False
             self._append_log("ERROR", "Auto-start failed repeatedly; giving up until next reconnect or manual start.")
-            await self._notify("Encoder failed to start. Open pw-ac3-live for details.")
+            await self._notify("Encoder failed to start. Open Surround Sound Fix for details.")
 
     # ------------------------------------------------------------------ sleep / resume
 

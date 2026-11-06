@@ -181,7 +181,7 @@ function Content() {
 
   const toastError = useCallback((error: BackendErrorPayload) => {
     toaster.toast({
-      title: `pw-ac3-live: ${error.code}`,
+      title: `Surround Sound Fix: ${error.code}`,
       body: error.message,
       critical: true,
     });
@@ -340,7 +340,7 @@ function Content() {
       }
     }
     if (await saveSettings({ advanced: advanced as AdvancedSettings })) {
-      toaster.toast({ title: "pw-ac3-live", body: "Advanced settings saved." });
+      toaster.toast({ title: "Surround Sound Fix", body: "Advanced settings saved." });
     }
   }, [advancedForm, allowExternal, binaryPath, saveSettings]);
 
@@ -491,12 +491,12 @@ export default definePlugin(() => {
   // Global listener so automatic actions (TV detected, wake from sleep) show a toast even
   // when the plugin panel is closed.
   const noticeListener = addEventListener<[message: string]>("automation_notice", (message) => {
-    toaster.toast({ title: "pw-ac3-live", body: message });
+    toaster.toast({ title: "Surround Sound Fix", body: message });
   });
 
   return {
-    name: "pw-ac3-live",
-    titleView: <div className={staticClasses.Title}>pw-ac3-live</div>,
+    name: "Surround Sound Fix",
+    titleView: <div className={staticClasses.Title}>Surround Sound Fix</div>,
     content: <Content />,
     icon: <FaVolumeUp />,
     onDismount() {
