@@ -45,6 +45,17 @@ DEFAULT_ALSA_LATENCY_US = 120000
 DEFAULT_ALSA_IEC_CARD = 0
 DEFAULT_ALSA_IEC_INDEX = 2
 PIPELINE_INPUT_SINK = "pw-ac3-live-input"
+# User-visible labels for the encoder's sink (Steam/game audio device lists). Applied at launch via
+# PIPEWIRE_PROPS, which pw_stream_new merges over the encoder's built-in properties; node.name is kept
+# because routing uses PIPELINE_INPUT_SINK.
+PIPELINE_INPUT_LABEL = "Surround Sound Fix (5.1)"
+PIPELINE_INPUT_PROPS = (
+    "{ "
+    f'node.description = "{PIPELINE_INPUT_LABEL}" '
+    'node.nick = "Surround Sound Fix" '
+    'application.name = "Surround Sound Fix" '
+    "}"
+)
 
 # Latency presets for the ALSA output buffer (more headroom = fewer stutters, more delay).
 LATENCY_PRESETS_US: dict[str, int] = {"low": 60000, "normal": 120000, "safe": 200000}
@@ -1168,6 +1179,7 @@ class Plugin:
         encoder: asyncio.subprocess.Process | None = None
         encoder_pgid: int | None = None
         subprocess_env = self._build_subprocess_env()
+        subprocess_env["PIPEWIRE_PROPS"] = PIPELINE_INPUT_PROPS
 
         try:
             encoder = await asyncio.create_subprocess_exec(
